@@ -185,7 +185,10 @@ function setupApiForm(formId, endpoint, successMsg) {
     }
 
     // Combine country code + national number into one field for the API.
-    if (data.phone) data.phone = `${data.phoneCode} ${data.phone}`.trim();
+    if (data.phone) {
+      const phoneCode = data.phoneCode || '+1';
+      data.phone = `${phoneCode} ${data.phone}`.trim();
+    }
     delete data.phoneCode;
 
     submitBtn.disabled = true;
@@ -197,13 +200,17 @@ function setupApiForm(formId, endpoint, successMsg) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
       });
-      if (!res.ok) throw new Error('request failed');
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData.error || 'request failed');
+      }
       status.textContent = successMsg;
       status.className = 'form-status ok';
       form.reset();
     } catch (err) {
       status.textContent = 'Something went wrong. Please email info@sblenergy.com directly.';
       status.className = 'form-status err';
+      console.error('Form submission error:', err.message);
     } finally {
       submitBtn.disabled = false;
     }
@@ -211,6 +218,17 @@ function setupApiForm(formId, endpoint, successMsg) {
 }
 setupApiForm('contactForm', '/api/contact', 'Thank you — our team will reach out shortly.');
 setupApiForm('careerForm', '/api/career', 'Thank you — our HR team will reach out shortly.');
+
+// ============ CHARACTER COUNTER FOR MESSAGE FIELD ============
+const messageField = document.getElementById('messageField');
+const charCount = document.getElementById('charCount');
+if (messageField && charCount) {
+  const updateCharCount = () => {
+    charCount.textContent = messageField.value.length;
+  };
+  messageField.addEventListener('input', updateCharCount);
+  messageField.addEventListener('change', updateCharCount);
+}
 
 // ============ SMOOTH ANCHOR SCROLL OFFSET ============
 document.querySelectorAll('a[href^="#"]').forEach(a => {

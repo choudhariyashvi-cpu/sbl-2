@@ -193,6 +193,7 @@
         <div class="form-field"><label>Cover Note</label><textarea name="message" rows="4" placeholder="Tell us a bit about your background..."></textarea></div>
         <input type="text" name="website" class="form-honeypot" tabindex="-1" autocomplete="off" aria-hidden="true" />
         <p class="form-status" id="careerFormStatus" role="status" aria-live="polite"></p>
+        <input type="hidden" id="recaptchaToken" name="recaptchaToken" />
         <button type="submit" class="btn btn-primary btn-full">Apply Now <span class="arrow">→</span></button>
       </form>
     </div>
@@ -249,5 +250,22 @@
 </footer>
 
 <script src="js/main.js"></script>
+
+<!-- Google reCAPTCHA v3 -->
+<script src="https://www.google.com/recaptcha/api.js"></script>
+<script>
+// Fetch and cache config immediately - BEFORE form can be submitted
+(async function initConfig() {
+  try {
+    const res = await fetch('/api/config');
+    const data = await res.json();
+    window.RECAPTCHA_SITE_KEY = data.recaptchaSiteKey;
+    console.log('✅ reCAPTCHA site key loaded:', window.RECAPTCHA_SITE_KEY ? 'yes' : 'no');
+  } catch (err) {
+    console.error('❌ Failed to load config:', err);
+    window.RECAPTCHA_SITE_KEY = '';
+  }
+})();
+</script>
 </body>
 </html>

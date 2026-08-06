@@ -16,3 +16,5 @@ assets/ALL Products Image/
 server/.env
 server/node_modules/
 
+server/data/
+server/logs/
