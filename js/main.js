@@ -164,15 +164,37 @@ function showFieldError(form, field, show) {
 }
 
 // ============ FORM SUBMIT (contact + career share this) ============
+// Fetch CSRF token when form loads
+async function fetchCsrfToken() {
+  try {
+    const res = await fetch('/api/csrf-token');
+    const data = await res.json();
+    return data.csrfToken;
+  } catch (err) {
+    console.error('Failed to fetch CSRF token:', err);
+    return null;
+  }
+}
+
 function setupApiForm(formId, endpoint, successMsg) {
   const form = document.getElementById(formId);
   if (!form) return;
   const status = form.querySelector('.form-status');
   const submitBtn = form.querySelector('button[type="submit"]');
+
+  // Fetch and inject CSRF token on page load
+  fetchCsrfToken().then(csrfToken => {
+    // Store token in a hidden field or variable
+    form.dataset.csrfToken = csrfToken;
+  });
+
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const data = Object.fromEntries(new FormData(form).entries());
     if (data.website) return; // honeypot tripped — silently drop
+
+    // Add CSRF token to request
+    data.csrfToken = form.dataset.csrfToken;
 
     const emailOk = isValidEmail(data.email);
     showFieldError(form, 'email', !emailOk);
@@ -180,6 +202,13 @@ function setupApiForm(formId, endpoint, successMsg) {
     showFieldError(form, 'phone', !phoneOk);
     if (!emailOk || !phoneOk) {
       status.textContent = 'Please fix the highlighted field(s) above.';
+      status.className = 'form-status err';
+      return;
+    }
+
+    // Check if CSRF token is available
+    if (!data.csrfToken) {
+      status.textContent = 'Security token missing. Please reload the page and try again.';
       status.className = 'form-status err';
       return;
     }
@@ -199,6 +228,7 @@ function setupApiForm(formId, endpoint, successMsg) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
+        credentials: 'same-origin'  // Include cookies in the request
       });
       if (!res.ok) {
         const errorData = await res.json().catch(() => ({}));
