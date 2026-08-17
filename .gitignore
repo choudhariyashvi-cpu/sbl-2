@@ -14,7 +14,10 @@ assets/ALL Products Image/
 
 # Contact form backend secrets / deps
 server/.env
-server/node_modules/
+
+# Installed dependencies, at any depth. npm install now runs from the repo root,
+# so this must not be scoped to server/ the way it was when the API lived there.
+node_modules/
 
 server/data/
 server/logs/

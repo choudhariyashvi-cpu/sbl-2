@@ -21,12 +21,147 @@ if (!TO_EMAIL) {
   process.exit(1);
 }
 
+// Cloudflare Turnstile. Both keys come from the same widget in the Cloudflare
+// dashboard, so a test sitekey needs the matching test secret. The sitekey is public
+// and is handed to the browser by /api/config; the secret never leaves the server.
+const TURNSTILE_SITE_KEY = process.env.TURNSTILE_SITE_KEY;
+const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY;
 
+if (!TURNSTILE_SITE_KEY || !TURNSTILE_SECRET_KEY) {
+  console.warn('⚠️  WARNING: TURNSTILE_SITE_KEY and/or TURNSTILE_SECRET_KEY are not set.');
+  console.warn('   The contact and career forms will not accept submissions.');
+  console.warn('   Add both to your .env file and restart the server.');
+}
+
+
+
+// ============ VISITOR SESSION ============
+// Layer 1 of the rate limiting has to tell one visitor from another. Browser headers
+// cannot: every Chrome-on-Windows visitor sends the same ones and lands in a single
+// shared bucket, while anyone willing to edit their user-agent mints a fresh bucket
+// per request. That restrained real visitors and nobody else.
+//
+// An id we issue ourselves is unique per browser, so each visitor gets their own
+// budget. It is still clearable — which is fine, and exactly why this is not the
+// security boundary. Clearing it drops the request onto the per-IP limit, which is
+// the layer that enforces. Fairness here, enforcement there.
+const SESSION_COOKIE = 'sbl_sid';
+const SESSION_MAX_AGE = 24 * 60 * 60 * 1000;  // 24 hours
+const SESSION_ID_PATTERN = /^[a-f0-9]{32}$/;
+
+// Signing makes a tampered id fail verification, so it is replaced rather than
+// trusted. Without a configured secret each boot invents one, which is harmless
+// while the rate-limit counters themselves live in memory and reset alongside it.
+const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+if (!process.env.SESSION_SECRET && process.env.NODE_ENV === 'production') {
+  console.warn('⚠️  WARNING: SESSION_SECRET is not set; using a random value for this boot.');
+  console.warn('   Visitor sessions are invalidated on every restart, handing everyone a');
+  console.warn('   fresh rate-limit budget. Set SESSION_SECRET in your .env to keep them stable.');
+}
 
 const app = express();
+
+// ============ SECURITY HEADERS ============
+// Registered first so they reach every response — pages, static assets, PDF
+// downloads, and error replies alike.
+//
+//   X-Frame-Options         no other site may display these pages inside a frame.
+//                           DENY rather than SAMEORIGIN because nothing here frames
+//                           anything of ours. Note the direction: this governs who
+//                           may frame us, not what we may frame, so the Turnstile
+//                           widget — a Cloudflare page inside our page — is unaffected.
+//   X-Content-Type-Options  take the Content-Type at its word instead of sniffing the
+//                           body, so a file served as a download can never be guessed
+//                           into being a page and executed on this origin.
+//   Permissions-Policy      empty allowlists. These capabilities are available to
+//                           nobody, this origin included, so no script on the page can
+//                           even raise the browser prompt asking a visitor for them.
+//
+// X-Powered-By is emitted by Express itself, so it is switched off rather than set.
+app.disable('x-powered-by');
+
+app.use((req, res, next) => {
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  next();
+});
+
 app.use(express.json());
-app.use(cookieParser());  // Parse cookies for CSRF token validation
+app.use(cookieParser(SESSION_SECRET));  // signed session id + CSRF token cookies
 // Static files moved to end (after PDF endpoint) so logging works
+
+// Hand a session id to any visitor arriving without a valid one. SameSite=Lax
+// rather than Strict because PDF downloads are top-level navigations that may
+// start from an external link; Strict would withhold the cookie there and drop
+// those visitors onto the shared IP bucket. This cookie is not a CSRF defence —
+// XSRF-TOKEN still carries that and stays Strict.
+app.use((req, res, next) => {
+  let sessionId = req.signedCookies[SESSION_COOKIE];
+
+  if (!sessionId || !SESSION_ID_PATTERN.test(sessionId)) {
+    sessionId = crypto.randomBytes(16).toString('hex');
+    res.cookie(SESSION_COOKIE, sessionId, {
+      httpOnly: true,      // no client-side code needs to read it
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'Lax',
+      maxAge: SESSION_MAX_AGE,
+      signed: true,
+      path: '/'
+    });
+  }
+
+  req.sessionId = sessionId;
+  next();
+});
+
+// ============ CLIENT IP / PROXY TRUST ============
+// X-Forwarded-For is written by whoever sends the request, so it is only worth
+// reading when a proxy we control wrote it. TRUST_PROXY names the hop allowed to do
+// that; Express then reads the header from the right, past the hops we vouch for,
+// and req.ip becomes the first address nobody vouched for.
+//
+// Defaults to false: assume no proxy, ignore the header, use the real socket
+// address. In production behind a proxy that setting is wrong in the safe
+// direction — every visitor shares the proxy's address and the per-IP limits get
+// strict — rather than wrong in the direction that lets anyone forge an identity.
+//
+//   loopback              nginx/Caddy on this machine, forwarding over localhost
+//   1                     exactly one proxy in front, whoever it happens to be
+//   10.0.0.5,1.2.3.0/24   specific proxy addresses or ranges
+function parseTrustProxy(raw) {
+  const value = String(raw || '').trim();
+
+  if (!value || value.toLowerCase() === 'false') return false;
+
+  // 'true' trusts the entire chain, which makes Express take the left-most value —
+  // the one the client wrote. That is precisely the hole this setting exists to
+  // close, so refuse it rather than quietly honouring it.
+  if (value.toLowerCase() === 'true') {
+    console.error('❌ TRUST_PROXY=true trusts client-supplied headers and is never correct.');
+    console.error('   Falling back to false. Use "loopback", a hop count, or proxy addresses.');
+    return false;
+  }
+
+  if (/^\d+$/.test(value)) return Number(value);  // a bare number is a hop count
+
+  return value;  // a named range ("loopback") or a comma-separated address list
+}
+
+const TRUST_PROXY = parseTrustProxy(process.env.TRUST_PROXY);
+app.set('trust proxy', TRUST_PROXY);
+
+if (TRUST_PROXY === false) {
+  console.log('ℹ️  trust proxy: false — X-Forwarded-For ignored, using the direct socket address.');
+  if (process.env.NODE_ENV === 'production') {
+    console.warn('⚠️  WARNING: NODE_ENV=production but TRUST_PROXY is not set.');
+    console.warn('   If a proxy fronts this server then every visitor arrives wearing its');
+    console.warn('   address, so one per-IP rate limit is shared by all of them at once.');
+    console.warn('   Set TRUST_PROXY in your .env (usually "loopback") and restart.');
+  }
+} else {
+  console.log(`ℹ️  trust proxy: ${TRUST_PROXY} — client IP read from X-Forwarded-For.`);
+}
 
 // ============ DATABASE SETUP ============
 const dbDir = path.join(__dirname, 'data');
@@ -168,33 +303,59 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-// Generate a fingerprint from browser headers (session/token-based rate limiting)
-function generateFingerprint(req) {
-  const userAgent = req.headers['user-agent'] || 'unknown';
-  const acceptLanguage = req.headers['accept-language'] || 'unknown';
-  const acceptEncoding = req.headers['accept-encoding'] || 'unknown';
+// ============ RATE LIMIT STATE CLEANUP ============
+// Each limiter below trims a visitor's own timestamps when that visitor returns, so
+// no single entry grows large. Nothing removes the entry itself, though: someone who
+// submits once and leaves stays in the map forever, and the maps end up sized by all
+// traffic ever seen rather than by recent traffic. Discarding the session cookie
+// mints a fresh key on every request, and layer 1 runs before the per-IP check, so
+// that growth follows request rate rather than visitor count.
+//
+// A periodic sweep drops entries whose window has already elapsed — once the window
+// has passed the entry can only ever filter down to empty, so it holds no answer
+// worth keeping.
+const SWEEP_INTERVAL = 5 * 60 * 1000;  // 5 minutes
 
-  const fingerprint = crypto
-    .createHash('sha256')
-    .update(userAgent + acceptLanguage + acceptEncoding)
-    .digest('hex');
-
-  return fingerprint;
+function sweepExpired(map, windowMs) {
+  const cutoff = Date.now() - windowMs;
+  for (const [key, times] of map) {
+    // timestamps are appended in order, so the last one is the newest
+    if (!times.length || times[times.length - 1] < cutoff) map.delete(key);
+  }
 }
 
-// ============ RATE LIMITING: LAYER 1 - SESSION/FINGERPRINT ============
-// In-memory rate limit: max 5 submissions per fingerprint per 10 minutes
-// Prevents same session from spamming even if headers are spoofed
+// Backstop for a burst arriving between two sweeps. Only the session-keyed maps get
+// a ceiling, because only their keys are attacker-chosen — a new cookie is a new
+// key. Capping the IP maps would let a flood evict real counters and so reset the
+// limit it is meant to enforce. Map iterates in insertion order, so the oldest keys
+// come first.
+function capSize(map, maxEntries, label) {
+  if (map.size <= maxEntries) return;
+
+  const excess = map.size - maxEntries;
+  let removed = 0;
+  for (const key of map.keys()) {
+    map.delete(key);
+    if (++removed >= excess) break;
+  }
+  console.warn(`⚠️ ${label} exceeded ${maxEntries} entries; evicted ${removed} oldest.`);
+}
+
+// ============ RATE LIMITING: LAYER 1 - VISITOR SESSION ============
+// In-memory rate limit: max 5 submissions per session per 10 minutes.
+// Keyed on the id issued above, so one visitor's spamming costs only their own
+// budget instead of everyone who happens to run the same browser.
 const sessionHits = new Map();
-function rateLimited(fingerprint) {
+const FORM_SESSION_WINDOW = 10 * 60 * 1000;  // 10 minutes
+const FORM_SESSION_MAX_KEYS = 50000;  // ceiling; far above any plausible real load
+
+function rateLimited(sessionId) {
   const now = Date.now();
-  const windowMs = 10 * 60 * 1000;
-  const entry = sessionHits.get(fingerprint) || [];
-  const recent = entry.filter((t) => now - t < windowMs);
+  const entry = sessionHits.get(sessionId) || [];
+  const recent = entry.filter((t) => now - t < FORM_SESSION_WINDOW);
   recent.push(now);
-  sessionHits.set(fingerprint, recent);
-  // Cleanup: remove fingerprints with no recent activity
-  if (recent.length === 0) sessionHits.delete(fingerprint);
+  sessionHits.set(sessionId, recent);
+  capSize(sessionHits, FORM_SESSION_MAX_KEYS, 'form session map');
   return recent.length > 5;
 }
 
@@ -215,12 +376,8 @@ function isIpRateLimited(ip) {
   // Add current request
   recent.push(now);
   ipHits.set(ip, recent);
-
-  // Cleanup: remove IPs with no recent activity
-  if (recent.length === 0) {
-    ipHits.delete(ip);
-    return false;
-  }
+  // Stale entries are dropped by the periodic sweep; no ceiling here, since evicting
+  // IP counters is exactly how a flood would reset the limit it just tripped.
 
   // Return true if over limit
   return recent.length > IP_LIMIT_MAX;
@@ -267,16 +424,24 @@ function generateCsrfToken() {
     createdAt: Date.now(),
     expires: Date.now() + CSRF_TOKEN_EXPIRY
   });
-  // Cleanup expired tokens every hour
-  if (csrfTokens.size > 10000) {
-    const now = Date.now();
-    for (const [token, data] of csrfTokens) {
-      if (data.expires < now) csrfTokens.delete(token);
-    }
-  }
   return token;
 }
 
+// Expired tokens are cleared on the sweep below rather than when a new one is issued.
+// The previous "only prune once the map passes 10,000 entries" rule did no work in
+// the case that needed it: under steady load the map sits above the threshold with
+// every token still unexpired, so each pass sweeps nothing and the map keeps growing.
+function sweepCsrfTokens() {
+  const now = Date.now();
+  for (const [token, data] of csrfTokens) {
+    if (data.expires < now) csrfTokens.delete(token);
+  }
+}
+
+// Checks a token without spending it. Validation runs before the Turnstile check and
+// the field checks, so consuming the token here would mean any rejected submission —
+// a mistyped email, an expired challenge — left the visitor holding a dead token and
+// staring at "please reload the page". The token stays valid until a message is sent.
 function validateCsrfToken(cookieToken, bodyToken) {
   // Both tokens must exist
   if (!cookieToken || !bodyToken) return false;
@@ -294,9 +459,14 @@ function validateCsrfToken(cookieToken, bodyToken) {
     return false;
   }
 
-  // Mark token as used (prevent replay attacks)
-  csrfTokens.delete(cookieToken);
   return true;
+}
+
+// Spends the token, called once a submission has actually been delivered. One token
+// still buys exactly one message — however many attempts it took to get there — so
+// replaying a captured request cannot send a second copy.
+function consumeCsrfToken(token) {
+  csrfTokens.delete(token);
 }
 
 // Retry wrapper for database operations (handles locked database)
@@ -313,11 +483,11 @@ function dbRunWithRetry(sql, params, callback, maxRetries = 3) {
   attempt();
 }
 
-// ============ CONFIG ENDPOINT ============
+// ============ CLIENT CONFIG ENDPOINT ============
+// Per-environment values the browser needs. Only ever expose public values here —
+// the Turnstile sitekey is designed to be visible in the page, the secret is not.
 app.get('/api/config', (req, res) => {
-  res.json({
-    recaptchaSiteKey: process.env.RECAPTCHA_SITE_KEY || '',
-  });
+  res.json({ turnstileSiteKey: TURNSTILE_SITE_KEY || '' });
 });
 
 // ============ CSRF TOKEN ENDPOINT ============
@@ -340,19 +510,19 @@ app.get('/api/csrf-token', (req, res) => {
 
 function makeFormHandler({ toEmail, subjectPrefix, buildHtml, logLabel, formType }) {
   return async (req, res) => {
-    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-    const fingerprint = generateFingerprint(req);
+    const ip = req.ip;  // derived per the trust proxy setting, not read from the header
+    const sessionId = req.sessionId;
 
     // ============ DUAL-LAYER RATE LIMITING ============
-    // Layer 1: Check rate limit using fingerprint (session/token-based)
-    // Prevents same session from spamming (max 5 per 10 minutes)
-    if (rateLimited(fingerprint)) {
-      logFormSubmission(ip, formType, 'rate_limit_exceeded_fingerprint');
+    // Layer 1: Per-visitor budget (max 5 per 10 minutes). Clearing the cookie buys
+    // a fresh one, which is why layer 2 below is the limit that actually enforces.
+    if (rateLimited(sessionId)) {
+      logFormSubmission(ip, formType, 'rate_limit_exceeded_session');
       return res.status(429).json({ error: 'Too many requests, please try again later.' });
     }
 
     // Layer 2: Check global IP rate limit (max 30 per hour per IP)
-    // Prevents botnet attacks and header-spoofing from single IP
+    // Catches anyone cycling sessions, and botnets working from a single address
     if (isIpRateLimited(ip)) {
       const ipCount = (ipHits.get(ip) || []).length;
       detectSuspiciousIpActivity(ip, ipCount);
@@ -378,39 +548,40 @@ function makeFormHandler({ toEmail, subjectPrefix, buildHtml, logLabel, formType
       return res.status(403).json({ error: 'CSRF token invalid or expired. Please reload the page and try again.' });
     }
 
-    // reCAPTCHA verification disabled for testing
-    if (false) {
-      const recaptchaToken = req.body.recaptchaToken;
-      if (!recaptchaToken) {
-        logFormSubmission(ip, formType, 'recaptcha_missing');
-        return res.status(400).json({ error: 'reCAPTCHA token missing. Please try again.' });
+    // ============ CLOUDFLARE TURNSTILE VERIFICATION ============
+    // Fail closed: without a secret we cannot tell humans from bots, so reject.
+    if (!TURNSTILE_SECRET_KEY) {
+      console.error('❌ Rejected submission: TURNSTILE_SECRET_KEY is not configured.');
+      logFormSubmission(ip, formType, 'turnstile_not_configured');
+      return res.status(500).json({ error: 'Verification unavailable. Please email us directly.' });
+    }
+
+    const turnstileToken = req.body?.turnstileToken;
+    if (!turnstileToken) {
+      logFormSubmission(ip, formType, 'turnstile_missing');
+      return res.status(400).json({ error: 'Verification missing. Please complete the challenge and try again.' });
+    }
+
+    try {
+      // remoteip is deliberately omitted: 'trust proxy' is not configured, so the
+      // forwarded client IP is spoofable and not worth binding the token to.
+      const verifyRes = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ secret: TURNSTILE_SECRET_KEY, response: turnstileToken })
+      });
+      const verifyData = await verifyRes.json();
+
+      if (!verifyData.success) {
+        // timeout-or-duplicate = expired (5 min) or replayed token; the rest are config errors.
+        console.warn(`⚠️ Turnstile failed for IP ${ip} (${formType}): ${verifyData['error-codes']?.join(',')}`);
+        logFormSubmission(ip, formType, 'turnstile_failed');
+        return res.status(400).json({ error: 'Verification failed. Please reload the page and try again.' });
       }
-
-      try {
-        const verifyUrl = 'https://www.google.com/recaptcha/api/siteverify';
-        const verifyRes = await fetch(verifyUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: `secret=${process.env.RECAPTCHA_SECRET_KEY}&response=${recaptchaToken}`
-        });
-        const verifyData = await verifyRes.json();
-
-        if (!verifyData.success) {
-          console.warn(`reCAPTCHA failed for IP ${ip}: ${verifyData['error-codes']?.join(',')}`);
-          logFormSubmission(ip, formType, 'recaptcha_failed');
-          return res.status(400).json({ error: 'reCAPTCHA verification failed. Please try again.' });
-        }
-
-        if (verifyData.score < 0.5) {
-          console.warn(`reCAPTCHA low score for IP ${ip}: ${verifyData.score}`);
-          logFormSubmission(ip, formType, 'recaptcha_low_score');
-          return res.status(400).json({ error: 'Suspicious activity detected. Please try again.' });
-        }
-      } catch (err) {
-        console.error('reCAPTCHA verification error:', err);
-        logFormSubmission(ip, formType, 'recaptcha_error');
-        return res.status(500).json({ error: 'Verification error. Please try again.' });
-      }
+    } catch (err) {
+      console.error('Turnstile verification error:', err);
+      logFormSubmission(ip, formType, 'turnstile_error');
+      return res.status(500).json({ error: 'Verification error. Please try again.' });
     }
 
     if (!name || !email) {
@@ -450,6 +621,7 @@ function makeFormHandler({ toEmail, subjectPrefix, buildHtml, logLabel, formType
         html: buildHtml(req.body),
       });
       console.log(`${logLabel} accepted by Gmail:`, info.messageId, info.response);
+      consumeCsrfToken(cookieToken);  // spent only now that the message is out
       logFormSubmission(ip, formType, 'success');
       res.json({ ok: true });
     } catch (err) {
@@ -562,25 +734,25 @@ setInterval(() => {
 }, PDF_WHITELIST_RELOAD_INTERVAL);
 
 // ============ PDF DOWNLOAD RATE LIMITING ============
-// Layer 1: Session/fingerprint-based (max 25 per 10 minutes)
+// Layer 1: Per-visitor session (max 25 per 10 minutes)
 // Allows legitimate bulk operations while preventing abuse
 const pdfSessionHits = new Map();
-const PDF_SESSION_LIMIT = 25;  // Max 25 downloads per 10 min per fingerprint
+const PDF_SESSION_LIMIT = 25;  // Max 25 downloads per 10 min per session
+const PDF_SESSION_WINDOW = 10 * 60 * 1000;  // 10 minutes
+const PDF_SESSION_MAX_KEYS = 50000;  // ceiling; far above any plausible real load
 const PDF_SESSION_THRESHOLD = 19;  // Alert at 75% of limit (0.75 × 25 = 18.75 ≈ 19)
 
-function pdfRateLimited(fingerprint) {
+function pdfRateLimited(sessionId) {
   const now = Date.now();
-  const windowMs = 10 * 60 * 1000; // 10 minutes
-  const entry = pdfSessionHits.get(fingerprint) || [];
-  const recent = entry.filter((t) => now - t < windowMs);
+  const entry = pdfSessionHits.get(sessionId) || [];
+  const recent = entry.filter((t) => now - t < PDF_SESSION_WINDOW);
   recent.push(now);
-  pdfSessionHits.set(fingerprint, recent);
-  // Cleanup: remove fingerprints with no recent activity
-  if (recent.length === 0) pdfSessionHits.delete(fingerprint);
+  pdfSessionHits.set(sessionId, recent);
+  capSize(pdfSessionHits, PDF_SESSION_MAX_KEYS, 'PDF session map');
 
   // Monitor high usage (at 75% of limit)
   if (recent.length >= PDF_SESSION_THRESHOLD && recent.length % 5 === 0) {
-    console.warn(`⚠️ PDF MONITOR: Fingerprint ${fingerprint} has ${recent.length}/${PDF_SESSION_LIMIT} downloads in 10 min`);
+    console.warn(`⚠️ PDF MONITOR: Session ${sessionId.slice(0, 8)} has ${recent.length}/${PDF_SESSION_LIMIT} downloads in 10 min`);
   }
 
   return recent.length > PDF_SESSION_LIMIT;
@@ -599,7 +771,7 @@ function isPdfIpRateLimited(ip) {
   const recent = entry.filter((t) => now - t < PDF_IP_LIMIT_WINDOW);
   recent.push(now);
   pdfIpHits.set(ip, recent);
-  if (recent.length === 0) pdfIpHits.delete(ip);
+  // Stale entries are dropped by the periodic sweep; deliberately no ceiling here.
 
   // Monitor high usage (at 75% of limit) - alert every 5 downloads past threshold
   if (recent.length >= PDF_IP_THRESHOLD) {
@@ -613,6 +785,18 @@ function isPdfIpRateLimited(ip) {
   return recent.length > PDF_IP_LIMIT_MAX;
 }
 
+// ============ PERIODIC SWEEP ============
+// Declared here because it is the first point at which every map exists. Each is
+// swept against its own window, so an entry survives exactly as long as it can still
+// affect a decision. Memory then tracks recent activity rather than all-time traffic.
+setInterval(() => {
+  sweepExpired(sessionHits, FORM_SESSION_WINDOW);
+  sweepExpired(ipHits, IP_LIMIT_WINDOW);
+  sweepExpired(pdfSessionHits, PDF_SESSION_WINDOW);
+  sweepExpired(pdfIpHits, PDF_IP_LIMIT_WINDOW);
+  sweepCsrfTokens();
+}, SWEEP_INTERVAL);
+
 app.get('/assets/:folder/:file', (req, res) => {
   // Normalize path to forward slashes for cross-platform consistency (whitelist uses forward slashes)
   const fullPath = `${req.params.folder}/${req.params.file}`;
@@ -622,26 +806,26 @@ app.get('/assets/:folder/:file', (req, res) => {
     return res.sendFile(path.join(SITE_ROOT, req.path));
   }
 
-  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-  const fingerprint = generateFingerprint(req);
+  const ip = req.ip;  // derived per the trust proxy setting, not read from the header
+  const sessionId = req.sessionId;
   const fileName = fullPath;
   const userAgent = req.headers['user-agent'] || 'unknown';
   const referer = req.headers['referer'] || 'direct';
 
   // ============ DUAL-LAYER PDF RATE LIMITING ============
-  // Layer 1: Check rate limit using fingerprint (session/token-based)
-  // Max: 25 downloads per 10 minutes per fingerprint
-  if (pdfRateLimited(fingerprint)) {
-    const sessionCount = (pdfSessionHits.get(fingerprint) || []).length;
+  // Layer 1: Per-visitor session budget
+  // Max: 25 downloads per 10 minutes per session
+  if (pdfRateLimited(sessionId)) {
+    const sessionCount = (pdfSessionHits.get(sessionId) || []).length;
     logDownload({
       ip_address: ip,
       file_name: fileName,
       file_size: 0,
       user_agent: userAgent,
       referer: referer,
-      status: 'rate_limit_exceeded_fingerprint'
+      status: 'rate_limit_exceeded_session'
     });
-    console.error(`🚨 PDF SESSION LIMIT BLOCKED: Fingerprint ${fingerprint} exceeded 25/10min (attempted ${sessionCount} downloads)`);
+    console.error(`🚨 PDF SESSION LIMIT BLOCKED: Session ${sessionId.slice(0, 8)} exceeded 25/10min (attempted ${sessionCount} downloads)`);
     return res.status(429).json({ error: 'Too many downloads from your session. Please wait 10 minutes and try again.' });
   }
 
@@ -784,8 +968,48 @@ app.get('/assets/:folder/:file', (req, res) => {
   }
 });
 
-// Serve static files AFTER PDF endpoint so logging works
-app.use(express.static(SITE_ROOT, { setHeaders: (res) => res.setHeader('Cache-Control', 'no-store') }));
+// ============ STATIC FILES ============
+// Served AFTER the PDF endpoint so downloads still get logged.
+//
+// SITE_ROOT is the repository root, which holds more than the public site: server/
+// (this file, .env, downloads.db, the CSV logs), build/ and _build_pages.py, plus
+// scraped-html/, overview-backups/ and the .md notes. Publishing that whole tree
+// would hand out the visitor logs and the server's own source, so only the four
+// asset directories and the generated pages are exposed. This is a whitelist on
+// purpose: a new file dropped into the repo is private until published deliberately.
+const PUBLIC_DIRS = ['assets', 'css', 'images', 'js'];
+const staticOptions = {
+  dotfiles: 'deny',
+  setHeaders: (res) => res.setHeader('Cache-Control', 'no-store'),
+};
+
+for (const dir of PUBLIC_DIRS) {
+  app.use(`/${dir}`, express.static(path.join(SITE_ROOT, dir), staticOptions));
+}
+
+// The pages themselves live directly in the root, so serve exactly those: a bare
+// filename ending in .html. The character class rules out separators and traversal,
+// so nothing outside SITE_ROOT is reachable and no sibling directory is walked into.
+const ROOT_PAGE = /^[A-Za-z0-9._-]+\.html$/;
+
+app.use((req, res, next) => {
+  if (req.method !== 'GET' && req.method !== 'HEAD') return next();
+
+  let pathname;
+  try {
+    pathname = decodeURIComponent(req.path);
+  } catch {
+    return next(); // malformed percent-encoding — not a page we serve
+  }
+
+  const name = pathname === '/' ? 'index.html' : pathname.slice(1);
+  if (!ROOT_PAGE.test(name)) return next();
+
+  res.setHeader('Cache-Control', 'no-store');
+  res.sendFile(path.join(SITE_ROOT, name), (err) => {
+    if (err) next();
+  });
+});
 
 app.listen(PORT, () => {
   console.log(`SBL Energy site + contact API running on http://localhost:${PORT}`);

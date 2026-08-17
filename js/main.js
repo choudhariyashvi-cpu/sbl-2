@@ -176,17 +176,68 @@ async function fetchCsrfToken() {
   }
 }
 
+// ============ CLOUDFLARE TURNSTILE ============
+// The sitekey is per-environment, so it comes from the server rather than the markup.
+// That means the widget is rendered explicitly, once we know which key to use.
+async function fetchSiteConfig() {
+  const res = await fetch('/api/config');
+  if (!res.ok) throw new Error('config request failed');
+  return res.json();
+}
+
+// Loads the Turnstile API once, no matter how many forms ask for it.
+let turnstileApiPromise = null;
+function loadTurnstileApi() {
+  if (turnstileApiPromise) return turnstileApiPromise;
+  turnstileApiPromise = new Promise((resolve, reject) => {
+    // Defining the callback before injecting the script avoids any load-order race.
+    window.onTurnstileReady = () => resolve(window.turnstile);
+    const script = document.createElement('script');
+    script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&onload=onTurnstileReady';
+    script.async = true;
+    script.defer = true;
+    script.onerror = () => reject(new Error('Turnstile script failed to load'));
+    document.head.appendChild(script);
+  });
+  return turnstileApiPromise;
+}
+
 function setupApiForm(formId, endpoint, successMsg) {
   const form = document.getElementById(formId);
   if (!form) return;
   const status = form.querySelector('.form-status');
   const submitBtn = form.querySelector('button[type="submit"]');
 
-  // Fetch and inject CSRF token on page load
-  fetchCsrfToken().then(csrfToken => {
-    // Store token in a hidden field or variable
-    form.dataset.csrfToken = csrfToken;
-  });
+  // Fetch and inject CSRF token on page load. A failed fetch has to clear the field
+  // rather than store it — assigning null to a dataset property writes the *string*
+  // "null", which reads as a real token here and is rejected by the server instead.
+  async function refreshCsrfToken() {
+    const csrfToken = await fetchCsrfToken();
+    if (csrfToken) form.dataset.csrfToken = csrfToken;
+    else delete form.dataset.csrfToken;
+  }
+  refreshCsrfToken();
+
+  const turnstileHost = form.querySelector('.turnstile-field');
+  let turnstileWidgetId = null;
+
+  (async function initTurnstile() {
+    if (!turnstileHost) return;
+    try {
+      const { turnstileSiteKey } = await fetchSiteConfig();
+      if (!turnstileSiteKey) throw new Error('TURNSTILE_SITE_KEY is not set on the server');
+      const turnstile = await loadTurnstileApi();
+      turnstileWidgetId = turnstile.render(turnstileHost, {
+        sitekey: turnstileSiteKey,
+        theme: 'dark'
+      });
+    } catch (err) {
+      // Without a widget the form cannot be submitted, so say so rather than fail silently.
+      console.error('Turnstile setup failed:', err.message);
+      status.textContent = 'Verification could not load. Please reload the page, or email info@sblenergy.com directly.';
+      status.className = 'form-status err';
+    }
+  })();
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -195,6 +246,13 @@ function setupApiForm(formId, endpoint, successMsg) {
 
     // Add CSRF token to request
     data.csrfToken = form.dataset.csrfToken;
+
+    // Turnstile also injects a hidden 'cf-turnstile-response' field into the form;
+    // read the token from the API instead and drop the stray field from the payload.
+    delete data['cf-turnstile-response'];
+    data.turnstileToken = (turnstileWidgetId !== null && window.turnstile)
+      ? window.turnstile.getResponse(turnstileWidgetId) || ''
+      : '';
 
     const emailOk = isValidEmail(data.email);
     showFieldError(form, 'email', !emailOk);
@@ -209,6 +267,13 @@ function setupApiForm(formId, endpoint, successMsg) {
     // Check if CSRF token is available
     if (!data.csrfToken) {
       status.textContent = 'Security token missing. Please reload the page and try again.';
+      status.className = 'form-status err';
+      return;
+    }
+
+    // Turnstile usually solves itself, but the token can still be pending or expired.
+    if (turnstileHost && !data.turnstileToken) {
+      status.textContent = 'Please complete the verification below and try again.';
       status.className = 'form-status err';
       return;
     }
@@ -232,17 +297,29 @@ function setupApiForm(formId, endpoint, successMsg) {
       });
       if (!res.ok) {
         const errorData = await res.json().catch(() => ({}));
-        throw new Error(errorData.error || 'request failed');
+        // The API explains why it rejected a submission (rate limit, failed verification,
+        // invalid field) in wording meant for the visitor, so pass it straight through.
+        throw Object.assign(new Error(errorData.error || 'request failed'), {
+          fromServer: Boolean(errorData.error)
+        });
       }
       status.textContent = successMsg;
       status.className = 'form-status ok';
       form.reset();
     } catch (err) {
-      status.textContent = 'Something went wrong. Please email info@sblenergy.com directly.';
+      // Anything without a server explanation is a network or unknown failure.
+      status.textContent = err.fromServer
+        ? err.message
+        : 'Something went wrong. Please email info@sblenergy.com directly.';
       status.className = 'form-status err';
       console.error('Form submission error:', err.message);
     } finally {
       submitBtn.disabled = false;
+      // Turnstile tokens are single-use, so issue a fresh one for the next attempt.
+      if (turnstileWidgetId !== null && window.turnstile) window.turnstile.reset(turnstileWidgetId);
+      // A delivered message spends its CSRF token, and a page left open long enough
+      // outlives one, so pick up a fresh token for whatever the visitor does next.
+      refreshCsrfToken();
     }
   });
 }
