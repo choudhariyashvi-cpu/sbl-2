@@ -1965,3 +1965,7 @@ html.preloading { overflow: hidden; }
 .form-status { min-height: 20px; font-size: 13.5px; margin-bottom: 12px; }
 .form-status.ok { color: #6fdc8c; }
 .form-status.err { color: var(--red-soft); }
+
+/* ============ CLOUDFLARE TURNSTILE ============ */
+/* Reserve the widget's height so the submit button doesn't jump once it loads. */
+.turnstile-field { margin-bottom: 18px; min-height: 65px; }
