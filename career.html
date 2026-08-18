@@ -190,7 +190,7 @@
           </div>
         </div>
         <div class="form-field"><label>Applying for the position</label><input type="text" name="position" placeholder="e.g. Production Engineer" /></div>
-        <div class="form-field"><label>Cover Note</label><textarea name="message" rows="4" placeholder="Tell us a bit about your background..."></textarea></div>
+        <div class="form-field message-field-wrapper"><label>Cover Note</label><div class="message-field-container"><textarea name="message" id="messageField" rows="4" maxlength="2000" required placeholder="Tell us a bit about your background..."></textarea><div class="char-counter"><span id="charCount">0</span>/2000</div></div></div>
         <input type="text" name="website" class="form-honeypot" tabindex="-1" autocomplete="off" aria-hidden="true" />
         <p class="form-status" id="careerFormStatus" role="status" aria-live="polite"></p>
         <!-- Cloudflare Turnstile mounts here. The sitekey comes from TURNSTILE_SITE_KEY

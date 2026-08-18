@@ -212,6 +212,44 @@ db.exec(`
 const logsDir = path.join(__dirname, 'logs');
 if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir);
 
+// Quoting a value keeps a spreadsheet from splitting it across columns, but it does
+// not stop the spreadsheet from *evaluating* it: Excel and Sheets treat a cell opening
+// with = + - @ tab or CR as a formula, so a visitor sending
+//   User-Agent: =cmd|'/c calc'!A1
+// gets that formula run by whoever opens the log — and the docs here tell the operator
+// to open it in Excel. A leading apostrophe marks the cell as literal text; the
+// spreadsheet consumes it, so the recorded value still reads correctly.
+//
+// Applied to every cell rather than to the two obvious headers, because file_name comes
+// from the decoded route params (logged before the whitelist rejects it) and ip_address
+// comes from req.ip — which is the socket address only while TRUST_PROXY is unset. Once
+// a proxy is trusted it is parsed out of X-Forwarded-For, and proxy-addr hands back
+// whatever token it finds there without checking that it looks like an address.
+function csvCell(value) {
+  const str = String(value);
+  const safe = /^[=+\-@\t\r]/.test(str) ? `'${str}` : str;
+  return `"${safe.replace(/"/g, '""')}"`;
+}
+
+// Logging must never be able to fail the request it describes. Excel takes an exclusive
+// lock on an open file, so an operator reading a log while the site runs would otherwise
+// turn every request that touches it into a 500 — and in the download path the error
+// handler calls the logger again, so the second throw escapes the handler entirely and
+// reaches Express with the stack attached.
+//
+// The header write is inside the guard as well. It runs on the first line ever written,
+// which is no less lockable than any line after it.
+function appendCsvLine(logFile, header, entry) {
+  try {
+    if (!fs.existsSync(logFile)) {
+      fs.writeFileSync(logFile, header + '\n');
+    }
+    fs.appendFileSync(logFile, entry + '\n');
+  } catch (err) {
+    console.warn(`⚠️ Could not write ${path.basename(logFile)} (file may be locked): ${err.message}`);
+  }
+}
+
 function logDownload(data) {
   const logFile = path.join(logsDir, 'downloads.csv');
   const timestamp = new Date().toISOString();
@@ -223,12 +261,9 @@ function logDownload(data) {
     data.user_agent ? data.user_agent.substring(0, 100) : 'unknown',
     data.referer || 'direct',
     data.status || 'unknown'
-  ].map(v => `"${String(v).replace(/"/g, '""')}"`).join(',');
+  ].map(csvCell).join(',');
 
-  if (!fs.existsSync(logFile)) {
-    fs.writeFileSync(logFile, 'timestamp,ip_address,file_name,file_size,user_agent,referer,status\n');
-  }
-  fs.appendFileSync(logFile, entry + '\n');
+  appendCsvLine(logFile, 'timestamp,ip_address,file_name,file_size,user_agent,referer,status', entry);
 
   dbRunWithRetry(`
     INSERT INTO downloads (ip_address, file_name, file_size, user_agent, referer, status)
@@ -242,17 +277,9 @@ function logDownload(data) {
 function logFormSubmission(ip, formType, status) {
   const logFile = path.join(logsDir, 'form_submissions.csv');
   const timestamp = new Date().toISOString();
-  const entry = `"${timestamp}","${ip}","${formType}","${status}"`;
+  const entry = [timestamp, ip, formType, status].map(csvCell).join(',');
 
-  if (!fs.existsSync(logFile)) {
-    fs.writeFileSync(logFile, 'timestamp,ip_address,form_type,status\n');
-  }
-
-  try {
-    fs.appendFileSync(logFile, entry + '\n');
-  } catch (err) {
-    console.warn(`⚠️ Warning: Could not write to CSV log (file may be locked): ${err.message}`);
-  }
+  appendCsvLine(logFile, 'timestamp,ip_address,form_type,status', entry);
 
   dbRunWithRetry(`
     INSERT INTO form_submissions (ip_address, form_type, status)
@@ -418,12 +445,19 @@ function sanitizeEmailHeader(str) {
 const csrfTokens = new Map();
 const CSRF_TOKEN_EXPIRY = 3600000;  // 1 hour in milliseconds
 
+// Backstop for a burst arriving between two sweeps, mirroring the session maps. This
+// one can evict a token a visitor is still holding, who then meets "please reload the
+// page" — so the ceiling sits far above the volume the limiter below permits, and is
+// only ever reached by a flood spread across enough IPs to clear that limiter first.
+const CSRF_TOKEN_MAX_KEYS = 50000;
+
 function generateCsrfToken() {
   const token = crypto.randomBytes(32).toString('hex');
   csrfTokens.set(token, {
     createdAt: Date.now(),
     expires: Date.now() + CSRF_TOKEN_EXPIRY
   });
+  capSize(csrfTokens, CSRF_TOKEN_MAX_KEYS, 'csrf token map');
   return token;
 }
 
@@ -436,6 +470,64 @@ function sweepCsrfTokens() {
   for (const [token, data] of csrfTokens) {
     if (data.expires < now) csrfTokens.delete(token);
   }
+}
+
+// ============ RATE LIMITING: CSRF TOKEN ISSUANCE ============
+// Issuing a token puts it in the map for a full hour, and the sweep above removes only
+// tokens that have already expired. Nothing bounded the endpoint itself, so a loop over
+// it added an entry per request for an hour at a time — unbounded growth on the one map
+// that never got the ceiling the session maps were given.
+//
+// Worth knowing how little of that growth was ever useful. XSRF-TOKEN holds a single
+// value, so issuing a token overwrites the only cookie that could have matched the
+// previous one, and validation requires the two to be equal. Every token except a
+// browser's newest is therefore already unusable, occupying the map as pure ballast.
+//
+// The limits sit well above real use: a page load spends one token and each delivered
+// message spends one more, and the form limiter caps those at 5 per 10 minutes, so a
+// visitor needs fewer than ten. The per-IP figure leaves room for an office behind one
+// address.
+const csrfSessionHits = new Map();
+const CSRF_SESSION_WINDOW = 10 * 60 * 1000;  // 10 minutes
+const CSRF_SESSION_MAX = 30;
+const CSRF_SESSION_MAX_KEYS = 50000;  // ceiling; keys are attacker-chosen, as elsewhere
+
+function csrfSessionRateLimited(sessionId) {
+  const now = Date.now();
+  const entry = csrfSessionHits.get(sessionId) || [];
+  const recent = entry.filter((t) => now - t < CSRF_SESSION_WINDOW);
+  recent.push(now);
+  csrfSessionHits.set(sessionId, recent);
+  capSize(csrfSessionHits, CSRF_SESSION_MAX_KEYS, 'csrf session map');
+
+  // Announced once, on the request that first crosses the line. Warning on every
+  // rejection would hand a flood the ability to write the log for as long as it ran.
+  if (recent.length === CSRF_SESSION_MAX + 1) {
+    console.warn(`⚠️ CSRF issuance: session ${sessionId.slice(0, 8)} over ${CSRF_SESSION_MAX} per 10 min`);
+  }
+
+  return recent.length > CSRF_SESSION_MAX;
+}
+
+// Discarding the session cookie mints a fresh key on every request, so the limit above
+// never trips for anyone doing that and this is the layer that actually holds. No
+// ceiling on this map, for the reason given at capSize.
+const csrfIpHits = new Map();
+const CSRF_IP_WINDOW = 60 * 60 * 1000;  // 1 hour
+const CSRF_IP_MAX = 200;
+
+function csrfIpRateLimited(ip) {
+  const now = Date.now();
+  const entry = csrfIpHits.get(ip) || [];
+  const recent = entry.filter((t) => now - t < CSRF_IP_WINDOW);
+  recent.push(now);
+  csrfIpHits.set(ip, recent);
+
+  if (recent.length === CSRF_IP_MAX + 1) {
+    console.warn(`🚨 CSRF issuance: IP ${ip} over ${CSRF_IP_MAX} per hour`);
+  }
+
+  return recent.length > CSRF_IP_MAX;
 }
 
 // Checks a token without spending it. Validation runs before the Turnstile check and
@@ -493,6 +585,15 @@ app.get('/api/config', (req, res) => {
 // ============ CSRF TOKEN ENDPOINT ============
 // Generate and return CSRF token for form protection
 app.get('/api/csrf-token', (req, res) => {
+  // Both layers are evaluated before a token exists, so a rejected request costs no
+  // memory. Neither call is short-circuited: each has to record the request, or a
+  // visitor already over one limit would stop accruing against the other.
+  const sessionOver = csrfSessionRateLimited(req.sessionId);
+  const ipOver = csrfIpRateLimited(req.ip);
+  if (sessionOver || ipOver) {
+    return res.status(429).json({ error: 'Too many requests. Please wait a moment and reload the page.' });
+  }
+
   const token = generateCsrfToken();
 
   // Set cookie with HttpOnly and SameSite=Strict for extra security
@@ -604,8 +705,11 @@ function makeFormHandler({ toEmail, subjectPrefix, buildHtml, logLabel, formType
     if (!message || message.trim().length === 0) {
       return res.status(400).json({ error: 'Message is required.' });
     }
-    if (message.length > 250) {
-      return res.status(400).json({ error: 'Message must be less than 250 characters.' });
+    // Keep this in step with the maxlength and counter on both forms (contact.html,
+    // career.html). A cap the markup does not advertise reads to the visitor as an
+    // unexplained rejection, since neither field is checked before submit.
+    if (message.length > 2000) {
+      return res.status(400).json({ error: 'Message must be less than 2000 characters.' });
     }
 
     try {
@@ -794,17 +898,26 @@ setInterval(() => {
   sweepExpired(ipHits, IP_LIMIT_WINDOW);
   sweepExpired(pdfSessionHits, PDF_SESSION_WINDOW);
   sweepExpired(pdfIpHits, PDF_IP_LIMIT_WINDOW);
+  sweepExpired(csrfSessionHits, CSRF_SESSION_WINDOW);
+  sweepExpired(csrfIpHits, CSRF_IP_WINDOW);
   sweepCsrfTokens();
 }, SWEEP_INTERVAL);
 
-app.get('/assets/:folder/:file', (req, res) => {
+app.get('/assets/:folder/:file', (req, res, next) => {
   // Normalize path to forward slashes for cross-platform consistency (whitelist uses forward slashes)
   const fullPath = `${req.params.folder}/${req.params.file}`;
 
-  // Only handle PDF requests; let express.static handle others
-  if (!req.path.endsWith('.pdf')) {
-    return res.sendFile(path.join(SITE_ROOT, req.path));
-  }
+  // Only handle PDF requests; hand everything else to the express.static mounts at
+  // the end of this file. Never build a filesystem path out of req.path: it arrives
+  // undecoded and unnormalized, so a literal ".." survives into path.join, which
+  // resolves it and walks out of assets/ into the repository root — straight past the
+  // PUBLIC_DIRS whitelist that exists to keep that root private. serve-static runs its
+  // own containment check against the mount root, so it is the safe place to land.
+  //
+  // The extension is read off the decoded params rather than req.path, so a request
+  // spelling it "%2Epdf" still takes the tracked path here instead of slipping past
+  // the rate limits and the download log into the static mount.
+  if (!fullPath.endsWith('.pdf')) return next();
 
   const ip = req.ip;  // derived per the trust proxy setting, not read from the header
   const sessionId = req.sessionId;
@@ -893,7 +1006,16 @@ app.get('/assets/:folder/:file', (req, res) => {
   }
 
   // ============ DEFENSE #2: SYMLINK PROTECTION (Option 2) ============
-  // Prevent symlink attacks - reject any symlinks
+  // Every symlink is refused outright, so there is no target left to validate. A check
+  // for one used to follow, from an earlier design where a link was allowed as long as
+  // its target stayed inside assets/; it could never run once the rule became "reject
+  // them all", because the return below fires first for exactly the files it asked
+  // about. Removing it also removes a readlinkSync that ran on every legitimate
+  // download purely to throw EINVAL and be swallowed.
+  //
+  // The whitelist does not make this redundant. It is built with readdirSync, which
+  // lists a symlink by name like any other entry, so a link named evil.pdf dropped into
+  // assets/ would be whitelisted — and this is what stops it being followed.
   try {
     const lstat = fs.lstatSync(filePath);  // lstat doesn't follow symlinks
     if (lstat.isSymbolicLink()) {
@@ -908,35 +1030,20 @@ app.get('/assets/:folder/:file', (req, res) => {
       console.error(`🚨 Security: Symlink traversal attempt from IP ${ip}: ${fileName}`);
       return res.status(403).send('Access denied');
     }
-
-    // Verify symlink target (if any) is still in allowed directory
-    const resolvedPath = path.resolve(fs.readlinkSync(filePath));
-    if (lstat.isSymbolicLink() && !resolvedPath.startsWith(allowedPath)) {
-      logDownload({
-        ip_address: ip,
-        file_name: fileName,
-        file_size: 0,
-        user_agent: userAgent,
-        referer: referer,
-        status: 'security_violation_symlink_target'
-      });
-      console.error(`🚨 Security: Symlink target outside allowed directory from IP ${ip}`);
-      return res.status(403).send('Access denied');
-    }
   } catch (err) {
-    // readlinkSync throws if file is not a symlink - that's fine
-    if (!err.message.includes('not a symbolic link') && !err.message.includes('EINVAL')) {
-      logDownload({
-        ip_address: ip,
-        file_name: fileName,
-        file_size: 0,
-        user_agent: userAgent,
-        referer: referer,
-        status: 'error_symlink_check'
-      });
-      console.error(`❌ Error checking symlink: ${err.message}`);
-      return res.status(500).send('Error downloading file');
-    }
+    // lstat is the only call left in here, and the file was confirmed to exist just
+    // above, so anything thrown now is a real filesystem error — not the expected
+    // EINVAL the readlink call used to raise on every ordinary file.
+    logDownload({
+      ip_address: ip,
+      file_name: fileName,
+      file_size: 0,
+      user_agent: userAgent,
+      referer: referer,
+      status: 'error_symlink_check'
+    });
+    console.error(`❌ Error checking symlink: ${err.message}`);
+    return res.status(500).send('Error downloading file');
   }
 
   try {
