@@ -80,10 +80,79 @@ const app = express();
 // X-Powered-By is emitted by Express itself, so it is switched off rather than set.
 app.disable('x-powered-by');
 
+//   Referrer-Policy         on a click out to LinkedIn or Google Maps, send only the
+//                           origin, never the full path. Cross-origin requests from a
+//                           product page would otherwise announce which product the
+//                           visitor was reading.
+//
+// Content-Security-Policy names where each kind of resource may come from, so injected
+// markup cannot pull a script off an attacker's host. The allowances below are exactly
+// what the site already uses — Turnstile's script and its challenge iframe, Google
+// Fonts' stylesheet and font files — and nothing else.
+//
+// 'unsafe-inline' in script-src is a real weakening and is here because the pages need
+// it: 5 of them carry an inline <script> block and 27 elements carry onclick/onsubmit
+// attributes, all of which a strict policy would switch off. What the policy still buys
+// is the part that matters most — an injected <script src="//evil.example"> is refused,
+// because the host is not on the list. Tightening it further is a markup job, not a
+// header job: move those handlers into js/main.js as addEventListener calls, then drop
+// 'unsafe-inline' from script-src. style-src needs it regardless, for the 134 style=""
+// attributes the pages use for layout.
+//
+// frame-ancestors repeats X-Frame-Options for browsers that honour CSP instead, and
+// form-action stops an injected <form> posting a visitor's details off-site.
+const CSP = [
+  "default-src 'self'",
+  "script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com",
+  "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+  "font-src 'self' https://fonts.gstatic.com",
+  "img-src 'self' data:",
+  "connect-src 'self' https://challenges.cloudflare.com",
+  "frame-src https://challenges.cloudflare.com",
+  "frame-ancestors 'none'",
+  "form-action 'self'",
+  "base-uri 'self'",
+  "object-src 'none'"
+].join('; ');
+
 app.use((req, res, next) => {
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Content-Security-Policy', CSP);
+
+  // HSTS tells the browser to reach this site over HTTPS only, for a year. Sent in
+  // production alone: on a plain-HTTP development server it would pin localhost to
+  // HTTPS in the developer's browser and make the site unreachable until the pin was
+  // manually cleared. Add 'preload' only once the certificate and every subdomain are
+  // known good — the preload list is slow to back out of.
+  if (process.env.NODE_ENV === 'production') {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+  next();
+});
+
+// ============ PATH NORMALISATION ============
+// "/assets//tds/x.pdf" and "/assets/tds/x.pdf" name the same file, but only the second
+// matches the '/assets/:folder/:file' route below: a doubled slash makes an extra,
+// empty segment that ':folder' will not match. The request then fell through to the
+// express.static mount at the end of this file and was served anyway — skipping the
+// whitelist, both rate limiters, and the download log. serve-static's own containment
+// still held, so nothing private leaked, but the download was invisible and uncapped.
+//
+// Collapsing the slashes before routing means every spelling of a path reaches the
+// same handler, so the tracked route cannot be sidestepped by punctuation.
+// Only the path is touched; the query string is left exactly as sent, since '//'
+// is meaningful inside a value (a URL, for instance).
+app.use((req, res, next) => {
+  const queryAt = req.url.indexOf('?');
+  const pathname = queryAt === -1 ? req.url : req.url.slice(0, queryAt);
+  const query = queryAt === -1 ? '' : req.url.slice(queryAt);
+
+  if (pathname.includes('//')) {
+    req.url = pathname.replace(/\/{2,}/g, '/') + query;
+  }
   next();
 });
 
@@ -685,6 +754,18 @@ function makeFormHandler({ toEmail, subjectPrefix, buildHtml, logLabel, formType
       return res.status(500).json({ error: 'Verification error. Please try again.' });
     }
 
+    // Every check below calls a string method. The form only ever sends strings, but
+    // this endpoint takes JSON from anywhere, so the body can carry any type — and
+    // `{"name":{}}` reaches .trim() as an object, throws inside this async handler,
+    // and takes the whole process down with it: Express 4 does not catch a rejected
+    // promise, so nothing turns it into a 500. Reject non-strings up front, before
+    // any of them is called.
+    for (const [field, value] of [['name', name], ['email', email], ['message', message]]) {
+      if (value !== undefined && typeof value !== 'string') {
+        return res.status(400).json({ error: `Invalid ${field}.` });
+      }
+    }
+
     if (!name || !email) {
       return res.status(400).json({ error: 'Name and email are required.' });
     }
@@ -1085,12 +1166,54 @@ app.get('/assets/:folder/:file', (req, res, next) => {
 // asset directories and the generated pages are exposed. This is a whitelist on
 // purpose: a new file dropped into the repo is private until published deliberately.
 const PUBLIC_DIRS = ['assets', 'css', 'images', 'js'];
-const staticOptions = {
-  dotfiles: 'deny',
-  setHeaders: (res) => res.setHeader('Cache-Control', 'no-store'),
+
+// ============ CACHING ============
+// Everything here used to be sent 'no-store', which forbids the browser from keeping
+// any copy at all. Correct for the HTML pages, wrong for the 56 MB of images and PDFs
+// underneath them: a visitor moving between two pages re-downloaded every shared logo
+// and background, and a returning visitor re-downloaded the entire site.
+//
+// The split is by how a file changes rather than by how big it is:
+//
+//   images, assets   content is fixed once published — a new photo arrives under a new
+//                    name. Safe to hold for a day; this is where the bandwidth goes.
+//   css, js          overwritten in place on every deploy, so a stored copy would go
+//                    stale invisibly. 'no-cache' still stores the file but revalidates
+//                    before each use, so an unchanged file costs a 304 instead of the
+//                    full body, and a changed one is picked up immediately.
+//
+// If css/ and js/ ever get content-hashed filenames, move them to the images policy —
+// a new hash is a new URL, so staleness stops being possible.
+const ONE_DAY_SECONDS = 24 * 60 * 60;
+const CACHE_POLICY = {
+  images: `public, max-age=${ONE_DAY_SECONDS}`,
+  assets: `public, max-age=${ONE_DAY_SECONDS}`,
+  css: 'no-cache',
+  js: 'no-cache',
 };
 
+// Fail-closed backstop for the tracked PDF route. Normalising the path above should
+// mean every .pdf request matches that route and never arrives here — this makes the
+// guarantee structural rather than dependent on that reasoning staying true. If some
+// other spelling slips past the route in future it now 404s, which is noticed, instead
+// of being served untracked and unlimited, which is not.
+//
+// Consequence worth knowing: a PDF nested deeper than assets/<folder>/<file> is
+// unreachable, because the tracked route only matches that one shape. There are none
+// today. Adding one means extending the route, not loosening this.
+app.use('/assets', (req, res, next) => {
+  if (req.path.toLowerCase().endsWith('.pdf')) {
+    console.warn(`⚠️ PDF request reached the static mount untracked: ${req.originalUrl}`);
+    return res.status(404).send('File not found');
+  }
+  next();
+});
+
 for (const dir of PUBLIC_DIRS) {
+  const staticOptions = {
+    dotfiles: 'deny',
+    setHeaders: (res) => res.setHeader('Cache-Control', CACHE_POLICY[dir] || 'no-store'),
+  };
   app.use(`/${dir}`, express.static(path.join(SITE_ROOT, dir), staticOptions));
 }
 
@@ -1116,6 +1239,49 @@ app.use((req, res, next) => {
   res.sendFile(path.join(SITE_ROOT, name), (err) => {
     if (err) next();
   });
+});
+
+// ============ ERROR HANDLING ============
+// Registered last, so it sees anything the routes above threw. Four arguments is what
+// marks a function as Express's error handler rather than ordinary middleware.
+//
+// This catches synchronous throws. An async handler that rejects does NOT reach here
+// on Express 4 — that is what the process-level guard below is for. Both exist so a
+// bug in one request fails that one request, instead of the whole site.
+app.use((err, req, res, next) => {
+  // Some errors already know their own status and are not server faults: express.json()
+  // rejects a malformed body with a 400 attached, and answering 500 there would blame
+  // the server for the sender's mistake — and tell a monitor the site is broken when it
+  // is working correctly. Honour a 4xx the error carries; treat anything else as a 500.
+  const declared = err.status || err.statusCode;
+  const status = declared >= 400 && declared < 500 ? declared : 500;
+
+  if (status === 500) {
+    console.error(`❌ Unhandled error on ${req.method} ${req.path}:`, err.message);
+  }
+
+  if (res.headersSent) return next(err);
+  res.status(status).json({
+    error: status === 500
+      ? 'Something went wrong. Please try again.'
+      : 'Malformed request.'
+  });
+});
+
+// Last resort. A rejected promise inside an async route is invisible to Express 4, and
+// Node's default response to an unhandled rejection is to terminate — so a single
+// malformed request could take the site down until someone restarted it. Logging and
+// staying up means the visitor who sent it sees nothing back (their request is already
+// lost) while everyone else keeps browsing.
+//
+// This is a backstop, not a licence to skip validation: anything landing here is a bug
+// worth fixing at the source, which is why it logs loudly.
+process.on('unhandledRejection', (reason) => {
+  console.error('🚨 Unhandled promise rejection (request dropped, server still up):', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('🚨 Uncaught exception (server still up):', err);
 });
 
 app.listen(PORT, () => {

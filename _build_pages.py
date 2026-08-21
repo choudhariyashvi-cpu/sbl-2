@@ -678,7 +678,7 @@ def build_category(filename, title, hero_title, hero_sub, hero_bg, tag, active_t
     # fix the hero_bg interpolation (used a different quoting above)
     html = html.replace('""" + hero_bg + """', hero_bg)
     html = html.replace('NEO ', 'NEO™ ')  # trademark after the NEO brand
-    with open(filename,'w') as f:
+    with open(filename, 'w', encoding='utf-8') as f:
         f.write(html)
     print('wrote', filename)
 
@@ -782,7 +782,7 @@ def build_stub(slug, name, cat, desc):
 </body>
 </html>'''
     html = html.replace('NEO ', 'NEO™ ')  # trademark after the NEO brand
-    with open(slug + '.html','w') as f:
+    with open(slug + '.html', 'w', encoding='utf-8') as f:
         f.write(html)
     print('wrote', slug + '.html')
 
@@ -1513,7 +1513,7 @@ def build_rich(slug, d):
 </body>
 </html>'''
     html = html.replace('NEO ', 'NEO™ ')  # trademark after the NEO brand
-    with open(slug + '.html', 'w') as f:
+    with open(slug + '.html', 'w', encoding='utf-8') as f:
         f.write(html)
     print('wrote (rich)', slug + '.html')
 
@@ -1642,7 +1642,7 @@ OLD_PROD_NAVS = ['<a href="#products">Products <span class="caret">▾</span></a
 
 swapped = 0
 for fn in glob.glob('*.html'):
-    with open(fn) as f:
+    with open(fn, encoding='utf-8') as f:
         txt = f.read()
     new = txt
     for old in (OLD_BLOCK, OLD_MEGA, OLD_MEGA2, OLD_MEGA3, OLD_MEGA4):
@@ -1661,7 +1661,7 @@ for fn in glob.glob('*.html'):
         if old in new:
             new = new.replace(old, NEW_PROD_NAV)
     if new != txt:
-        with open(fn,'w') as f:
+        with open(fn, 'w', encoding='utf-8') as f:
             f.write(new)
         swapped += 1
 print('existing pages updated:', swapped)
