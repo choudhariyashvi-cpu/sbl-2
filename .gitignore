@@ -21,3 +21,8 @@ node_modules/
 
 server/data/
 server/logs/
+
+# Internal test runbook. Kept locally and published as a private Artifact rather
+# than committed — it documents internal paths, log lines and rate-limit
+# thresholds, which need not be in a public repo.
+docs/
