@@ -168,7 +168,7 @@ one with no error. Keep the data outside the deploy path in production.
 ## Which files are public
 
 Only `assets/ css/ images/ js/` and bare `.html` files in the root are served.
-Everything else — `server/`, `build/`, `docs/`, `scraped-html/`, the `.md` notes
+Everything else — `server/`, `docs/`, `scraped-html/`, the `.md` notes
 — is unreachable over the web. This is a whitelist on purpose: a new folder is
 private until deliberately published.
 
@@ -210,9 +210,10 @@ missing, ask whoever maintains the site for a copy.
 
 ## Regenerating pages
 
-`_build_pages.py` generates the product pages from shared templates. The scripts
-in `build/` are an earlier generation of the same idea and are no longer the ones
-being edited — check before using them.
+`_build_pages.py` generates the category and product pages from data tables in
+the file itself. Read its header first: it also rewrites every root `.html` to
+swap navbar and footer blocks, which is one-time migration logic rather than an
+idempotent build. Commit before running, and read the diff afterwards.
 
 ```bash
 python _build_pages.py
@@ -232,8 +233,7 @@ server/.env           secrets (gitignored; .env.example documents every key)
 server/data/          SQLite database (gitignored)
 server/logs/          CSV logs (gitignored)
 docs/                 test runbook — gitignored, local only (see Verifying)
-_build_pages.py       page generator
-build/                earlier generator, superseded
+_build_pages.py       page generator (read its header before running)
 overview-backups/     original copy from the pre-rewrite site, kept for reference
 scraped-html/         original scraped pages, reference only, not served
 ```

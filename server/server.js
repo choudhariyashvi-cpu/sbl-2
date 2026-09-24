@@ -1160,7 +1160,7 @@ app.get('/assets/:folder/:file', (req, res, next) => {
 // Served AFTER the PDF endpoint so downloads still get logged.
 //
 // SITE_ROOT is the repository root, which holds more than the public site: server/
-// (this file, .env, downloads.db, the CSV logs), build/ and _build_pages.py, plus
+// (this file, .env, downloads.db, the CSV logs), _build_pages.py, docs/, plus
 // scraped-html/, overview-backups/ and the .md notes. Publishing that whole tree
 // would hand out the visitor logs and the server's own source, so only the four
 // asset directories and the generated pages are exposed. This is a whitelist on

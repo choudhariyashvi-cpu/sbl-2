@@ -87,10 +87,15 @@ not from rejecting input.
 
 ## Page generation
 
-`_build_pages.py` (root) is the current generator. The three scripts in `build/`
-are an earlier generation of the same idea, kept but no longer edited. If you
-touch page templates, confirm which one actually produced the page you are
-looking at.
+`_build_pages.py` (root) is the generator. A second, older set of scripts lived
+in `build/` until September 2026; it was deleted because `generate_pages.py`
+there rewrote `career.html` and `contact.html` from templates predating
+Turnstile, the honeypot and the character counter — running it would have
+stripped the bot protection off both forms without anything appearing broken.
+Recover it from history if needed: `git show fc5ff83:build/generate_pages.py`.
+
+Note that `contact.html` and `career.html` are hand-maintained. No generator
+produces them now, by design.
 
 ## Documentation map
 

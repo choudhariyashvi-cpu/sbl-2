@@ -1,4 +1,32 @@
 #!/usr/bin/env python3
+# ══════════════════════════════════════════════════════════════════════════════
+# The page generator. This is the only one — an earlier set of scripts lived in
+# build/ and was deleted in September 2026, because build/generate_pages.py
+# rewrote career.html and contact.html from templates predating Turnstile, the
+# honeypot and the character counter, and would have stripped the bot protection
+# off both forms with no visible breakage. Recover it from git history if ever
+# needed: git show fc5ff83:build/generate_pages.py
+#
+# READ BEFORE RUNNING. This script does two different jobs:
+#
+#   1. Generates the 5 category pages and the product pages, from the data
+#      tables further down this file. Hand-edits to any generated page are
+#      overwritten — change the tables here, not the HTML.
+#
+#   2. Rewrites EVERY *.html in the repo root (see the glob near the end),
+#      find-and-replacing old navbar/footer blocks with current ones. That pass
+#      touches contact.html and career.html too, which are otherwise
+#      hand-maintained. It only writes when something actually matched, so on a
+#      site already migrated it is a no-op — but it is a whole-file rewrite when
+#      it does match.
+#
+# Much of part 2 is one-time migration logic from an earlier layout. It is not a
+# clean idempotent build, so commit or stash your work before running, and read
+# the diff afterwards rather than assuming it did nothing.
+#
+# Production never runs this. The generated HTML is committed and the server
+# only serves finished files — no Python is installed on the server.
+# ══════════════════════════════════════════════════════════════════════════════
 import os, glob, re
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
